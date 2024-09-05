@@ -141,10 +141,48 @@ pip install -r requirements.txt
 ```
 python tracker.py
 ```
+Доступные опции:
+```
+'--gt_path'                 Path for ground truth tracks
+
+
+'--imgs_path'               Input dir for images
+
+
+'--videos_path'             Input dir for videos
+
+
+'--input_video_path'        Input path for new video
+
+
+'--output_video_path'       Out path for a processed video
+
+
+'-v'                        Process a regular video by a given index: 0-5
+
+
+'-vb'                       Process a blured video by a given index: 0-18
+
+
+'--model_weights'           Path to YOLO model weights
+
+
+'--tracker'                 Tracker model
+
+
+'--show_video'              Wheither to show video of tracking or not
+
+
+'--metrics'                 Count metric or not
+
+
+'--first_n_frames'          Apply only to first n frames
+```
+
 `*` - исходя из того, что `tracker.py` пользуется относительными путями, он должен находиться в одной папке с Datasets и Videos.
-* (дополнение от Алексея Новикова:) по всей видимости, в моей адаптации SMILEtrack к ultralytics имеется баг, который не позволяет отслеживать состояние, когда треков нет, что выражается в `results[0].boxes.id` всегда равным `None`. Это не позволяет на данный момент отлавливать событие отсутствия треков, что на участках без мусора может вывалить трекер в ошибку.
+* (дополнение от Алексея Новикова:) по всей видимости, в моей адаптации SMILEtrack к ultralytics имеется баг, который не позволяет отслеживать состояние, когда треков нет, что выражается в `results[0].boxes.id` всегда равным `None`. Это не позволяет на данный момент отлавливать событие отсутствия треков, что на участках без мусора может вывалить трекер в ошибку. Эта ошибка была исправлена после дедлайна, чтобы не менять исходный файл, добавлен файл `tracker_fixed.py`.
 
 ## Demo
 ```
-python tracker.py --input_video_path ./Videous/test.mp4
+python tracker.py --input_video_path './Videos/test.mp4' --metrics
 ```
