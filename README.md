@@ -186,3 +186,10 @@ python tracker.py
 ```
 python tracker.py --input_video_path './Videos/test.mp4' --metrics
 ```
+
+### Авторы
+- [Алексей Новиков](https://github.com/burooom)
+- [Генчель Ксения](https://github.com/genchel)
+- [filon-mary](https://github.com/filon-mary)
+- [Бежанов Александр](https://github.com/bezhanovap)
+- [Павлов-Теремок Дмитрий](https://github.com/DinoWithPython)
