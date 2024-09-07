@@ -203,6 +203,8 @@ for i, frame in enumerate(cap):
                 history['coord'].pop(0)
                 history['class_id'].pop(0)
                 history['center'].pop(0)
+            points = np.hstack(history['center']).astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame, [points], isClosed=False, color=(230, 230, 230), thickness=4)
         if args.show_video:
             cv2.namedWindow('video', 0)
             cv2.imshow(frame, 'video', 1)
