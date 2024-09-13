@@ -4,42 +4,31 @@ import json
 import sys
 import os
 import torch
+import functools
+import warnings
 
 import numpy as np
 import pandas as pd
 import motmetrics as mm
 import pandas as pd
+import torch.nn as nn
+import torch.nn.functional as F
 
+from torch.nn import init
+from torch.optim import lr_scheduler
+from torch.hub import load_state_dict_from_url
 from collections import defaultdict, deque, OrderedDict
 from ultralytics import YOLO
 from matplotlib import pyplot as plt
 from matplotlib import patches
 
+from ultralytics.trackers.basetrack import TrackState
+from ultralytics.trackers.byte_tracker import STrack
 from ultralytics.trackers.utils import matching
 from ultralytics.trackers.utils.gmc import GMC
 from ultralytics.trackers.utils.kalman_filter import KalmanFilterXYWH as KalmanFilter
 from ultralytics.utils.downloads import safe_download
 from ultralytics.utils import ops, IterableSimpleNamespace, yaml_load
-
-# целиком файлы
-# SMILEtrack.tracker.SLM
-# SMILEtrack.tracker.resnet
-# чтобы не импортировать из датасета. Эту ячейку можно целиком игнорировать, если подключить датасет
-import torch
-import torch.nn as nn
-from torch.nn import init
-import torch.nn.functional as F
-from torch.optim import lr_scheduler
-
-import functools
-from einops import rearrange
-
-# from .resnet import *
-
-import warnings
-
-#from torchvision.models.utils import load_state_dict_from_url
-from torch.hub import load_state_dict_from_url
 
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
            'resnet152', 'resnext50_32x4d', 'resnext101_32x8d',
@@ -932,94 +921,76 @@ def extract_image_patches(image, bboxes):
     return patches
 
 # Определение классов отслеживания состояния трека и базового класса трекинга
-class TrackState(object):
-    New = 0
-    Tracked = 1
-    Lost = 2
-    LongLost = 3
-    Removed = 4
+class SMTrack(STrack):
+    """
+    An extended version of the STrack class for YOLOv8, adding object tracking features.
 
+    This class extends the STrack class to include additional functionalities for object tracking, such as feature
+    smoothing, Kalman filter prediction, and reactivation of tracks.
 
-class BaseTrack(object):
-    _count = 0
+    Attributes:
+        shared_kalman (KalmanFilterXYWH): A shared Kalman filter for all instances of SMTrack.
+        smooth_feat (np.ndarray): Smoothed feature vector.
+        curr_feat (np.ndarray): Current feature vector.
+        features (deque): A deque to store feature vectors with a maximum length defined by `feat_history`.
+        alpha (float): Smoothing factor for the exponential moving average of features.
+        mean (np.ndarray): The mean state of the Kalman filter.
+        covariance (np.ndarray): The covariance matrix of the Kalman filter.
 
-    track_id = 0
-    is_activated = False
-    state = TrackState.New
+    Methods:
+        update_features(feat): Update features vector and smooth it using exponential moving average.
+        predict(): Predicts the mean and covariance using Kalman filter.
+        re_activate(new_track, frame_id, new_id): Reactivates a track with updated features and optionally new ID.
+        update(new_track, frame_id): Update the YOLOv8 instance with new track and frame ID.
+        tlwh: Property that gets the current position in tlwh format `(top left x, top left y, width, height)`.
+        multi_predict(stracks): Predicts the mean and covariance of multiple object tracks using shared Kalman filter.
+        convert_coords(tlwh): Converts tlwh bounding box coordinates to xywh format.
+        tlwh_to_xywh(tlwh): Convert bounding box to xywh format `(center x, center y, width, height)`.
 
-    history = OrderedDict()
-    features = []
-    curr_feature = None
-    score = 0
-    start_frame = 0
-    frame_id = 0
-    time_since_update = 0
+    Examples:
+        Create a SMTrack instance and update its features
+        >>> sm_track = SMTrack(tlwh=[100, 50, 80, 40], score=0.9, cls=1, feat=np.random.rand(128))
+        >>> sm_track.predict()
+        >>> new_track = SMTrack(tlwh=[110, 60, 80, 40], score=0.85, cls=1, feat=np.random.rand(128))
+        >>> sm_track.update(new_track, frame_id=2)
+    """
 
-    # multi-camera
-    location = (np.inf, np.inf)
-
-    @property
-    def end_frame(self):
-        return self.frame_id
-
-    @staticmethod
-    def next_id():
-        BaseTrack._count += 1
-        return BaseTrack._count
-
-    def activate(self, *args):
-        raise NotImplementedError
-
-    def predict(self):
-        raise NotImplementedError
-
-    def update(self, *args, **kwargs):
-        raise NotImplementedError
-
-    def mark_lost(self):
-        self.state = TrackState.Lost
-
-    def mark_long_lost(self):
-        self.state = TrackState.LongLost
-
-    def mark_removed(self):
-        self.state = TrackState.Removed
-
-    @staticmethod
-    def clear_count():
-        BaseTrack._count = 0
-
-# Определение класса для обработки единичных объектов 
-class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
 
     def __init__(self, tlwh, score, cls, feat=None, feat_history=50):
+        """
+        Initialize a SMTrack object with temporal parameters, such as feature history, alpha, and current features.
 
-        # wait activate
+        Args:
+            tlwh (np.ndarray): Bounding box coordinates in tlwh format (top left x, top left y, width, height).
+            score (float): Confidence score of the detection.
+            cls (int): Class ID of the detected object.
+            feat (np.ndarray | None): Feature vector associated with the detection.
+            feat_history (int): Maximum length of the feature history deque.
+
+        Examples:
+            Initialize a SMTrack object with bounding box, score, class ID, and feature vector
+            >>> tlwh = np.array([100, 50, 80, 120])
+            >>> score = 0.9
+            >>> cls = 1
+            >>> feat = np.random.rand(128)
+            >>> sm_track = SMTrack(tlwh, score, cls, feat)
+        """
+        super().__init__(tlwh, score, cls)
+
         self._tlwh = np.asarray(self.tlbr_to_tlwh(tlwh[:-1]), dtype=np.float32)
-        self.kalman_filter = None
-        self.mean, self.covariance = None, None
-        self.is_activated = False
-
-        self.cls = -1
-        self.cls_hist = []  # (cls id, freq)
-        self.update_cls(cls, score)
-
-        self.score = score
-        self.tracklet_len = 0
-
         self.smooth_feat = None
         self.curr_feat = None
         if feat is not None:
             self.update_features(feat)
-        #Добавление отслеживания признаков
         self.features = deque([], maxlen=feat_history)
         self.alpha = 0.9
-        #Добавление отслеживания индексов и угла
-        self.idx = tlwh[-1]
-        self.angle = tlwh[4] if len(tlwh) == 6 else None
+        self.class_ids = -1
+        self.cls_hist = []  # (cls id, freq)
+        self.update_cls(cls, score)
 
     def update_features(self, feat):
+        """Update the feature vector and apply exponential moving average smoothing."""
         feat /= np.linalg.norm(feat)
         self.curr_feat = feat
         if self.smooth_feat is None:
@@ -1029,26 +1000,28 @@ class STrack(BaseTrack):
         self.features.append(feat)
         self.smooth_feat /= np.linalg.norm(self.smooth_feat)
 
-    def update_cls(self, cls, score):
+    def update_cls(self, class_ids, score):
+        """Updates the class ID and score for the track."""
         if len(self.cls_hist) > 0:
             max_freq = 0
             found = False
             for c in self.cls_hist:
-                if cls == c[0]:
+                if class_ids == c[0]:
                     c[1] += score
                     found = True
 
                 if c[1] > max_freq:
                     max_freq = c[1]
-                    self.cls = c[0]
+                    self.class_ids = c[0]
             if not found:
-                self.cls_hist.append([cls, score])
-                self.cls = cls
+                self.cls_hist.append([class_ids, score])
+                self.class_ids = class_ids
         else:
-            self.cls_hist.append([cls, score])
-            self.cls = cls
+            self.cls_hist.append([class_ids, score])
+            self.class_ids = class_ids
 
     def predict(self):
+        """Predicts the object's future state using the Kalman filter to update its mean and covariance."""
         mean_state = self.mean.copy()
         if self.state != TrackState.Tracked:
             mean_state[6] = 0
@@ -1056,96 +1029,21 @@ class STrack(BaseTrack):
 
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
-    @staticmethod
-    def multi_predict(stracks):
-        if len(stracks) > 0:
-            multi_mean = np.asarray([st.mean.copy() for st in stracks])
-            multi_covariance = np.asarray([st.covariance for st in stracks])
-            for i, st in enumerate(stracks):
-                if st.state != TrackState.Tracked:
-                    multi_mean[i][6] = 0
-                    multi_mean[i][7] = 0
-            multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
-            for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
-                stracks[i].mean = mean
-                stracks[i].covariance = cov
-
-    @staticmethod
-    def multi_gmc(stracks, H=np.eye(2, 3)):
-        if len(stracks) > 0:
-            multi_mean = np.asarray([st.mean.copy() for st in stracks])
-            multi_covariance = np.asarray([st.covariance for st in stracks])
-
-            R = H[:2, :2]
-            R8x8 = np.kron(np.eye(4, dtype=float), R)
-            t = H[:2, 2]
-
-            for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
-                mean = R8x8.dot(mean)
-                mean[:2] += t
-                cov = R8x8.dot(cov).dot(R8x8.transpose())
-
-                stracks[i].mean = mean
-                stracks[i].covariance = cov
-
-    def activate(self, kalman_filter, frame_id):
-        """Start a new tracklet"""
-        self.kalman_filter = kalman_filter
-        self.track_id = self.next_id()
-
-        self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xywh(self._tlwh))
-
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        if frame_id == 1:
-            self.is_activated = True
-        self.frame_id = frame_id
-        self.start_frame = frame_id
-
     def re_activate(self, new_track, frame_id, new_id=False):
-
-        self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance, self.tlwh_to_xywh(new_track.tlwh))
+        """Reactivates a track with updated features and optionally assigns a new ID."""
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        self.is_activated = True
-        self.frame_id = frame_id
-        if new_id:
-            self.track_id = self.next_id()
-        self.score = new_track.score
-
-        self.update_cls(new_track.cls, new_track.score)
+        super().re_activate(new_track, frame_id, new_id)
 
     def update(self, new_track, frame_id):
-        """
-        Update a matched track
-        :type new_track: STrack
-        :type frame_id: int
-        :type update_feature: bool
-        :return:
-        """
-        self.frame_id = frame_id
-        self.tracklet_len += 1
-
-        new_tlwh = new_track.tlwh
-
-        self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance, self.tlwh_to_xywh(new_tlwh))
-
+        """Updates the YOLOv8 instance with new track information and the current frame ID."""
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
-
-        self.state = TrackState.Tracked
-        self.is_activated = True
-
-        self.score = new_track.score
-        self.update_cls(new_track.cls, new_track.score)
+        super().update(new_track, frame_id)
 
     @property
     def tlwh(self):
-        """Get current position in bounding box format `(top left x, top left y,
-                width, height)`.
-        """
+        """Returns the current bounding box position in `(top left x, top left y, width, height)` format."""
         if self.mean is None:
             return self._tlwh.copy()
         ret = self.mean[:4].copy()
@@ -1154,66 +1052,52 @@ class STrack(BaseTrack):
 
     @property
     def tlbr(self):
-        """Convert bounding box to format `(min x, min y, max x, max y)`, i.e.,
-        `(top left, bottom right)`.
-        """
+        """Convert bounding box to format (min x, min y, max x, max y), i.e., (top left, bottom right)."""
         ret = self.tlwh.copy()
         ret[2:] += ret[:2]
         return ret
-    
-    @property
-    def xyxy(self):
-        """Converts bounding box from (top left x, top left y, width, height) to (min x, min y, max x, max y) format."""
-        ret = self.tlwh.copy()
-        ret[2:] += ret[:2]
-        return ret
-
-    @property
-    def xywh(self):
-        """Convert bounding box to format `(min x, min y, max x, max y)`, i.e.,
-        `(top left, bottom right)`.
-        """
-        ret = self.tlwh.copy()
-        ret[:2] += ret[2:] / 2.0
-        return ret
-
-    @staticmethod
-    def tlwh_to_xyah(tlwh):
-        """Convert bounding box to format `(center x, center y, aspect ratio,
-        height)`, where the aspect ratio is `width / height`.
-        """
-        ret = np.asarray(tlwh).copy()
-        ret[:2] += ret[2:] / 2
-        ret[2] /= ret[3]
-        return ret
-
-    @staticmethod
-    def tlwh_to_xywh(tlwh):
-        """Convert bounding box to format `(center x, center y, width,
-        height)`.
-        """
-        ret = np.asarray(tlwh).copy()
-        ret[:2] += ret[2:] / 2
-        return ret
-
-    def to_xywh(self):
-        return self.tlwh_to_xywh(self.tlwh)
 
     @staticmethod
     def tlbr_to_tlwh(tlbr):
+        """Converts top-left bottom-right format to top-left width height format."""
         ret = np.asarray(tlbr).copy()
         ret[2:] -= ret[:2]
         return ret
 
     @staticmethod
     def tlwh_to_tlbr(tlwh):
+        """Converts tlwh bounding box format to tlbr format."""
         ret = np.asarray(tlwh).copy()
         ret[2:] += ret[:2]
         return ret
 
-    def __repr__(self):
-        return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame, self.end_frame)
-    
+    @staticmethod
+    def multi_predict(stracks):
+        """Predicts the mean and covariance for multiple object tracks using a shared Kalman filter."""
+        if len(stracks) <= 0:
+            return
+        multi_mean = np.asarray([st.mean.copy() for st in stracks])
+        multi_covariance = np.asarray([st.covariance for st in stracks])
+        for i, st in enumerate(stracks):
+            if st.state != TrackState.Tracked:
+                multi_mean[i][6] = 0
+                multi_mean[i][7] = 0
+        multi_mean, multi_covariance = SMTrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
+        for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
+            stracks[i].mean = mean
+            stracks[i].covariance = cov
+
+    def convert_coords(self, tlwh):
+        """Converts tlwh bounding box coordinates to xywh format."""
+        return self.tlwh_to_xywh(tlwh)
+
+    @staticmethod
+    def tlwh_to_xywh(tlwh):
+        """Convert bounding box from tlwh (top-left-width-height) to xywh (center-x-center-y-width-height) format."""
+        ret = np.asarray(tlwh).copy()
+        ret[:2] += ret[2:] / 2
+        return ret
+
 
 class SMILEtrack(object):
     def __init__(self, args, frame_rate=30):
@@ -1221,11 +1105,11 @@ class SMILEtrack(object):
         self.tracked_stracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
         self.removed_stracks = []  # type: list[STrack]
-        BaseTrack.clear_count()
+        self.reset_id()
 
         self.frame_id = 0
         self.args = args
-        self.device = args.device
+        self.device = ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.track_high_thresh = args.track_high_thresh
         self.track_low_thresh = args.track_low_thresh
@@ -1234,33 +1118,37 @@ class SMILEtrack(object):
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilter()
-        
+
 
         # Переопределение обработки параметров для ReID
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
-
+        # if args.weight_path is not None:
+        #     self.weight_path = args.weight_path
+        # else:
+        #     self.weight_path = './sm_weights/ver12.pt'
+        #
+        # if self.args.with_reid:
+        #     # check if self.weight_path is exists if not asset
+        #     if not os.path.exists(self.weight_path):
+        #         safe_download('https://drive.google.com/file/d/1RDuVo7jYBkyBR4ngnBaVQUtHL8nAaGaL/view',
+        #                       self.weight_path)
         if self.args.with_reid:
-            if args.reid_default:
-                self.weight_path = args.weight_path
-                # check if self.weight_path is exists if not asset
-                if not os.path.exists(self.weight_path):
-                    safe_download('https://drive.google.com/file/d/1RDuVo7jYBkyBR4ngnBaVQUtHL8nAaGaL/view',
-                                  self.weight_path)
-                self.encoder = load_model(self.weight_path)
-                if self.device == 'cuda' or self.device == 'cuda:0':
-                    self.encoder = self.encoder.to(torch.device('cuda:0'))
-                elif self.device == 'mps':
-                    self.encoder = self.encoder.to(torch.device('mps'))
-                else:
-                    self.encoder = self.encoder.to(torch.device('cpu'))
-                self.encoder = self.encoder.eval()
+            cur_dir = os.path.dirname(__file__)
+            self.weight_path = os.path.join(cur_dir, 'ver12.pt')
+            if not os.path.exists(self.weight_path):
+                safe_download('https://drive.google.com/file/d/1RDuVo7jYBkyBR4ngnBaVQUtHL8nAaGaL/view', dir=cur_dir)
+            self.encoder = load_model(self.weight_path)
+
+            if self.device == 'cuda' or self.device == 'cuda:0':
+                self.encoder = self.encoder.to(torch.device('cuda:0'))
             else:
-                self.args.with_reid = False
+                self.encoder = self.encoder.to(torch.device('cpu'))
+            self.encoder = self.encoder.eval()
 
         self.gmc = GMC(method=args.gmc_method)
 
-    def update(self, output_results, img):
+    def update(self, results, img):
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
@@ -1268,27 +1156,27 @@ class SMILEtrack(object):
         removed_stracks = []
         features_keep = None
 
-        if len(output_results):
+        if len(results):
             #Переопределние инициализации на формат Ultralytics
-            bboxes = output_results.xyxy
+            bboxes = results.xyxy
             bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
-            scores = output_results.conf
-            classes = output_results.cls
-            
-            
+            scores = results.conf
+            classes = results.cls
+
+
             # Remove bad detections
             lowest_inds = scores > self.track_low_thresh
             bboxes = bboxes[lowest_inds]
             scores = scores[lowest_inds]
             classes = classes[lowest_inds]
-            
+
 
             # Find high threshold detections
             remain_inds = scores > self.args.track_high_thresh
             dets = bboxes[remain_inds]
             scores_keep = scores[remain_inds]
             classes_keep = classes[remain_inds]
-            
+
         else:
             bboxes = []
             scores = []
@@ -1296,7 +1184,7 @@ class SMILEtrack(object):
             dets = []
             scores_keep = []
             classes_keep = []
-    
+
         '''Extract embeddings '''
         if self.args.with_reid:
             # set dets features
@@ -1308,9 +1196,9 @@ class SMILEtrack(object):
                 features[time, :] = self.encoder.inference_forward_fast(patches_det[time].type(torch.float32))
 
             features_keep = features.cpu().detach().numpy()
-      
 
-                   
+
+
         detections = self.init_track(dets, scores_keep, classes_keep, features_keep, img)
 
         ''' Add newly detected tracklets to tracked_stracks'''
@@ -1326,12 +1214,12 @@ class SMILEtrack(object):
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
 
         # Predict the current location with KF
-        STrack.multi_predict(strack_pool)
+        SMTrack.multi_predict(strack_pool)
 
         # Fix camera motion
         warp = self.gmc.apply(img, dets)
-        STrack.multi_gmc(strack_pool, warp)
-        STrack.multi_gmc(unconfirmed, warp)
+        SMTrack.multi_gmc(strack_pool, warp)
+        SMTrack.multi_gmc(unconfirmed, warp)
 
         dists = self.get_dists(strack_pool, detections)
 
@@ -1362,7 +1250,7 @@ class SMILEtrack(object):
 
         # association the untrack to the low score detections
         detections_second = self.init_track(dets_second, scores_second, classes_second, img=img)
-            
+
 
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
@@ -1386,7 +1274,7 @@ class SMILEtrack(object):
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
         dists = matching.iou_distance(unconfirmed, detections)
-        if not self.args.mot20:
+        if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
         matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
         for itracked, idet in matches:
@@ -1423,26 +1311,24 @@ class SMILEtrack(object):
 
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
-            
+
         #Переопределение вывода на формат Ultralytics
-        return np.asarray(
-            [x.tlbr.tolist() + [x.track_id, x.score, x.cls, x.idx] for x in self.tracked_stracks if x.is_activated],
-            dtype=np.float32)
-    
-    
+        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+
+
     def init_track(self, dets, scores, cls, features=None, img=None):
         """Initialize object tracking with detections and scores using STrack algorithm."""
         if len(dets) > 0:
             """Detections."""
             if self.args.with_reid and features is not None:
-                detections = [STrack(xyxy, s, c, f) for (xyxy, s, c, f) in zip(dets, scores, cls, features)]
+                detections = [SMTrack(xyxy, s, c, f) for (xyxy, s, c, f) in zip(dets, scores, cls, features)]
             else:
-                detections = [STrack(xyxy, s, c) for (xyxy, s, c) in zip(dets, scores, cls)]
+                detections = [SMTrack(xyxy, s, c) for (xyxy, s, c) in zip(dets, scores, cls)]
         else:
             detections = []
 
         return detections
-    
+
     def get_dists(self, tracks, detections):
         """Get distances between tracks and detections using IoU and (optionally) ReID embeddings."""
         dists = matching.iou_distance(tracks, detections)
@@ -1457,7 +1343,12 @@ class SMILEtrack(object):
             dists = np.minimum(dists, emb_dists)
         return dists
 
-    
+    @staticmethod
+    def reset_id():
+        """Resets the ID counter for SMTrack instances to ensure unique track IDs across tracking sessions."""
+        SMTrack.reset_id()
+
+
     #Добавление общих фукнций в методы класса
     @staticmethod
     def joint_stracks(tlista, tlistb):
