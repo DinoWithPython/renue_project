@@ -225,7 +225,7 @@ class Tracking():
 
         if len(self.empty_tracks) > 0:
             print('Empty track found on frames:')
-            print(selfempty_tracks, '\n')
+            print(self.empty_tracks, '\n')
 
         print(f'''Inference stats:
               \tFrames: {len(self.cap)}
