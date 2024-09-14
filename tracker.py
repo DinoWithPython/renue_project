@@ -3,7 +3,6 @@ import cv2
 import json
 import mmcv
 import torch
-import os
 import numpy as np
 import motmetrics as mm
 from collections import defaultdict
@@ -62,7 +61,6 @@ class Tracking():
             self.tracker = DeepSort(**tracker_args)
 
         elif tracker_type =='smile':
-            # pass
             from ultralytics.utils import IterableSimpleNamespace
             from smile_note import SMILEtrack
 
@@ -83,9 +81,9 @@ class Tracking():
             self.tracker = SMILEtrack(tracker_args)
 
     def prepare_det_res(self, res):
-        '''Different trackers have different formats of input
-        input: det_results
-        output: formated det_results'''
+        '''Formats detector's output to proper trackrer input
+        since different trackers have different formats of input
+        input: det_results; output: formated det_results'''
         if self.tracker_type == 'deep':
             return [[*ops.xyxy2ltwh(res[0].boxes[i].xyxy.cpu()).tolist(),
                      res[0].boxes[i].conf.cpu().item(),
@@ -122,8 +120,8 @@ class Tracking():
 
     def process_frame(self, frame_i, frame):
         '''Processes a frame depending on the "tracker_type":
-        detection -> tracking -> writing history and making output video with tracks printed
-        measures time on the per frame basis
+        detection -> tracking -> writing history and making output video with tracks printed;
+        measures detection an tracking time on the per frame basis
         input: frame; output: frame'''
         if self.tracker_type == 'smile':
             start = time()
@@ -198,16 +196,18 @@ class Tracking():
         self.out.write(frame)
 
     def history_to_json(self):
-        '''Dumps "track_history" to disk as JSON'''
+        '''Dumps "track_history" to disk as a JSON file'''
         json_results = json.dumps(self.track_history)
         with open("./tracking_results.json", "w") as json_file:
             json_file.write(json_results)
 
     def mot_metrics(self):
-        '''A modified version of the script one can found here: https://github.com/cheind/py-motmetrics
-        as motMetricsEnhancedCalculator'''
+        '''Computes and returns metrics MOTA, MOTP, Precision, Recall and the number of switches
+        This is a modified version of the script one can found here: https://github.com/cheind/py-motmetrics
+        as a motMetricsEnhancedCalculator function'''
         t = np.array(self.mm_results)
-        gt = self.gt[np.where(self.gt[:,0] == t[:,0].min())[0].min():np.where(self.gt[:,0] == t[:,0].max())[0].max()+1] #slicing gt at max and min frame numbers found in t
+        gt = self.gt[np.where(self.gt[:,0] == t[:,0].min())[0].min():
+                     np.where(self.gt[:,0] == t[:,0].max())[0].max()+1] #slicing gt at max and min frame numbers found in t
         acc = mm.MOTAccumulator(auto_id=True)
         for frame in range(int(gt[:,0].max())):
             frame += 1 # detection and frame ndef check_path(path):
@@ -253,7 +253,7 @@ if __name__ == "__main__":
 
     video = str(args.videos_path / '31-03-2024-09%3A34%3A24.mp4')
     if args.input_video_path is not None:
-        video = str(Path(args.input_video_path))
+        video = args.input_video_path
 
     gt_path = None
     if args.metrics:
